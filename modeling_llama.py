@@ -69,24 +69,16 @@ if att_cfg_file is not None:
         att_cfg = yaml.safe_load(stream)
 
 
-res = faiss.StandardGpuResources()
+#res = faiss.StandardGpuResources()
 def get_index(index, d):
-    if index == "flat":
-        #Index = faiss.IndexFlatIP(d)
-        Index = faiss.GpuIndexFlatIP(res, d)
-    elif index == "lsh":
-        Index =  faiss.IndexLSH(d, att_cfg["faiss"]["nbits"])
-    else:
-        raise NotImplementedError
-    #if "use_gpu" in att_cfg.keys() and att_cfg["use_gpu"]:
-    #    Index = faiss.index_cpu_to_gpu(res, 0, Index)
-
+    Index = faiss.index_factory(d, index, faiss.METRIC_INNER_PRODUCT)
     return Index
     
 
 FAISS = []
 if att_cfg is not None and att_cfg["mode"] == "top-faiss":
     print("preparing FAISS for retreival")
+    faiss.omp_set_num_threads(att_cfg["faiss"]["threads"])
 
     for i in range(32):
         modules = []
@@ -99,6 +91,16 @@ if att_cfg is not None and att_cfg["mode"] == "top-faiss":
 
 
 def approximate_attention(attn_weights, layer_idx, keys, queries):
+    ''' 
+            inputs are 
+            attn_weights: unnormlized attention weights
+            layer_idx: layer number
+            keys: previous + current keys
+            queries: current queries 
+
+            returns modified attn_weights by adding correct mask 
+    '''
+
     # if layer_idx == 0:
     #     print(keys.shape)
     if att_cfg_file is None:
@@ -152,28 +154,25 @@ def approximate_attention(attn_weights, layer_idx, keys, queries):
     elif att_cfg["mode"] == "top-faiss":
         local_num = att_cfg["local"]["num"]
         first_num = att_cfg["first"]["num"]
+        assert(b == 1)
         mask = torch.tril(torch.ones(q,k,device=attn_weights.device), diagonal=k-q-local_num)
         mask[:,:first_num] = 0.
         mask = mask.unsqueeze(0).unsqueeze(0).broadcast_to(attn_weights.shape).contiguous()
 
-        #assert(q <= local_num)
-        # get topk from what was populated earlier.
-        # keep topk from where mask = 1
-        # to_be_masked_att = torch.minimum(( (mask - 0.5) * 2 )  * 3.3895e+38, attn_weights)
-
+        # move to cpu
+        queries_cpu = np.array(queries.cpu().detach().float())
+        keys_cpu = np.array(keys.cpu().detach().float())
         topks = []
         for i in range(32):
             if FAISS[layer_idx][i].ntotal > 0:
                 # print("querying", FAISS[layer_idx][i].ntotal, "keys", k, q, flush=True)
-                _, topk = FAISS[layer_idx][i].search(queries[0][i].float(), att_cfg["top"]["num"])
+                _, topk = FAISS[layer_idx][i].search(queries_cpu[0][i], att_cfg["top"]["num"])
                 topks.append(topk)
-            FAISS[layer_idx][i].add(keys[0][i][-q:].float())
+            FAISS[layer_idx][i].add(keys_cpu[0][i][-q:])
             
         if len(topks) > 0:
-            #idx = torch.from_numpy(np.stack(topks)).cuda()
-            idx = torch.stack(topks)
+            idx = torch.from_numpy(np.stack(topks)).cuda()
             idx = idx.unsqueeze(0)
-            #_, idx = torch.topk(to_be_masked_att, att_cfg["top"]["num"], dim=-1)
             view_idx = idx.view(-1,idx.shape[-1])
             view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
             mask.view(-1)[view_idx.view(-1)] = 0.
