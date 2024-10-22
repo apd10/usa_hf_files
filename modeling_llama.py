@@ -167,8 +167,10 @@ def approximate_attention(attn_weights, layer_idx, keys, queries):
             if FAISS[layer_idx][i].ntotal > 0:
                 # print("querying", FAISS[layer_idx][i].ntotal, "keys", k, q, flush=True)
                 _, topk = FAISS[layer_idx][i].search(queries_cpu[0][i], att_cfg["top"]["num"])
-                topks.append(topk)
-            FAISS[layer_idx][i].add(keys_cpu[0][i][-q:])
+                topks.append(topk + first_num)
+            start = max(first_num, k-q)
+            if start < k:
+                FAISS[layer_idx][i].add(keys_cpu[0][i][start:])
             
         if len(topks) > 0:
             idx = torch.from_numpy(np.stack(topks)).cuda()
