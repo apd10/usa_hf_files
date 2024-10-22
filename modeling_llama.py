@@ -51,7 +51,7 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_llama import LlamaConfig
-
+import time
 
 logger = logging.get_logger(__name__)
 
@@ -73,9 +73,9 @@ if att_cfg_file is not None:
 def get_index(index, d):
     Index = faiss.index_factory(d, index, faiss.METRIC_INNER_PRODUCT)
     return Index
-    
 
 FAISS = []
+FAISS_STATS = {}
 if att_cfg is not None and att_cfg["mode"] == "top-faiss":
     print("preparing FAISS for retreival")
     faiss.omp_set_num_threads(att_cfg["faiss"]["threads"])
@@ -87,8 +87,25 @@ if att_cfg is not None and att_cfg["mode"] == "top-faiss":
         FAISS.append(modules)
 
     print("FAISS setup with type:", att_cfg["faiss"]["index"])
+    FAISS_STATS['indexing'] = {}
+    FAISS_STATS['indexing']['time'] = []
+    FAISS_STATS['indexing']['index_size'] = []
+    FAISS_STATS['indexing']['insert_size'] = []
+    FAISS_STATS['querying'] = {}
+    FAISS_STATS['querying']['time'] = []
+    FAISS_STATS['querying']['index_size'] = []
+    FAISS_STATS['querying']['query_size'] = []
+    
 
-
+def dump_faiss_stats(fname):
+    import numpy as np
+    np.savez(fname, index_ntotal=np.array(FAISS_STATS['indexing']['index_size']),
+                    index_insert=np.array(FAISS_STATS['indexing']['insert_size']),
+                    index_time=np.array(FAISS_STATS['indexing']['time']),
+                    query_ntotal=np.array(FAISS_STATS['querying']['index_size']),
+                    query_insert=np.array(FAISS_STATS['querying']['query_size']),
+                    query_time=np.array(FAISS_STATS['querying']['time'])
+             )
 
 def approximate_attention(attn_weights, layer_idx, keys, queries):
     ''' 
@@ -159,25 +176,50 @@ def approximate_attention(attn_weights, layer_idx, keys, queries):
         mask[:,:first_num] = 0.
         mask = mask.unsqueeze(0).unsqueeze(0).broadcast_to(attn_weights.shape).contiguous()
 
-        # move to cpu
-        queries_cpu = np.array(queries.cpu().detach().float())
-        keys_cpu = np.array(keys.cpu().detach().float())
-        topks = []
-        for i in range(32):
-            if FAISS[layer_idx][i].ntotal > 0:
-                # print("querying", FAISS[layer_idx][i].ntotal, "keys", k, q, flush=True)
-                _, topk = FAISS[layer_idx][i].search(queries_cpu[0][i], att_cfg["top"]["num"])
-                topks.append(topk + first_num)
-            start = max(first_num, k-q)
-            if start < k:
-                FAISS[layer_idx][i].add(keys_cpu[0][i][start:])
-            
-        if len(topks) > 0:
-            idx = torch.from_numpy(np.stack(topks)).cuda()
-            idx = idx.unsqueeze(0)
-            view_idx = idx.view(-1,idx.shape[-1])
-            view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
-            mask.view(-1)[view_idx.view(-1)] = 0.
+        if ("skip_layers" in att_cfg.keys() 
+            and (layer_idx < att_cfg["skip_bot_layers"]
+                 or  layer_idx > att_cfg["skip_top_layers"]
+                 or  ("skip_odd" in att_cfg.keys() and layer_idx % 2 == 1)
+                 or  ("skip_even" in att_cfg.keys() and layer_idx % 2 == 0)
+                )
+            ):
+            #print("skipped", layer_idx)
+            pass
+        else:
+
+
+            # move to cpu
+            queries_cpu = np.array(queries.cpu().detach().float())
+            keys_cpu = np.array(keys.cpu().detach().float())
+            topks = []
+            for i in range(32):
+                if FAISS[layer_idx][i].ntotal > 0:
+                    # print("querying", FAISS[layer_idx][i].ntotal, "keys", k, q, flush=True)
+                    q_s_time = time.time()
+                    _, topk = FAISS[layer_idx][i].search(queries_cpu[0][i], att_cfg["top"]["num"])
+                    q_e_time = time.time()
+                    topks.append(topk + first_num)
+                    FAISS_STATS['querying']['index_size'].append(FAISS[layer_idx][i].ntotal)
+                    FAISS_STATS['querying']['query_size'].append(queries_cpu[0][i].shape[0])
+                    FAISS_STATS['querying']['time'].append(q_e_time - q_s_time)
+
+                start = max(first_num, k-q)
+                if start < k:
+                    i_s_time = time.time()
+                    FAISS[layer_idx][i].add(keys_cpu[0][i][start:])
+                    i_e_time = time.time()
+                    
+                    FAISS_STATS['indexing']['index_size'].append(FAISS[layer_idx][i].ntotal)
+                    FAISS_STATS['indexing']['insert_size'].append(keys_cpu[0][i][start:].shape[0])
+                    FAISS_STATS['indexing']['time'].append(i_e_time - i_s_time)
+
+                
+            if len(topks) > 0:
+                idx = torch.from_numpy(np.stack(topks)).cuda()
+                idx = idx.unsqueeze(0)
+                view_idx = idx.view(-1,idx.shape[-1])
+                view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
+                mask.view(-1)[view_idx.view(-1)] = 0.
 
         mask = mask * -3.3895e+38
         attn_weights = attn_weights + mask
