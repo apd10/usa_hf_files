@@ -61,6 +61,7 @@ import os
 import yaml
 import faiss
 import faiss.contrib.torch_utils
+import concurrent.futures as futures
 
 att_cfg_file = os.environ.get("ATT_CONFIG", None)
 att_cfg = None
@@ -106,6 +107,23 @@ def dump_faiss_stats(fname):
                     query_insert=np.array(FAISS_STATS['querying']['query_size']),
                     query_time=np.array(FAISS_STATS['querying']['time'])
              )
+
+def faiss_operations(faiss, layer_idx, att_idx, keys, queries, offset, top_num):
+    topk = None
+    k = keys.shape[0]
+    q = queries.shape[0]
+
+    if faiss.ntotal > 0:
+        # print("querying", FAISS[layer_idx][i].ntotal, "keys", k, q, flush=True)
+        _, topk = faiss.search(queries, top_num)
+        topk = topk + offset
+        topk
+        
+    start = max(offset, k-q)
+    if start < k:
+        faiss.add(keys[start:])
+
+    return layer_idx, att_idx, topk
 
 def approximate_attention(attn_weights, layer_idx, keys, queries):
     ''' 
@@ -186,41 +204,33 @@ def approximate_attention(attn_weights, layer_idx, keys, queries):
             #print("skipped", layer_idx)
             pass
         else:
-
-
             # move to cpu
             queries_cpu = np.array(queries.cpu().detach().float())
             keys_cpu = np.array(keys.cpu().detach().float())
-            topks = []
-            for i in range(32):
-                if FAISS[layer_idx][i].ntotal > 0:
-                    # print("querying", FAISS[layer_idx][i].ntotal, "keys", k, q, flush=True)
-                    q_s_time = time.time()
-                    _, topk = FAISS[layer_idx][i].search(queries_cpu[0][i], att_cfg["top"]["num"])
-                    q_e_time = time.time()
-                    topks.append(topk + first_num)
-                    FAISS_STATS['querying']['index_size'].append(FAISS[layer_idx][i].ntotal)
-                    FAISS_STATS['querying']['query_size'].append(queries_cpu[0][i].shape[0])
-                    FAISS_STATS['querying']['time'].append(q_e_time - q_s_time)
-
-                start = max(first_num, k-q)
-                if start < k:
-                    i_s_time = time.time()
-                    FAISS[layer_idx][i].add(keys_cpu[0][i][start:])
-                    i_e_time = time.time()
-                    
-                    FAISS_STATS['indexing']['index_size'].append(FAISS[layer_idx][i].ntotal)
-                    FAISS_STATS['indexing']['insert_size'].append(keys_cpu[0][i][start:].shape[0])
-                    FAISS_STATS['indexing']['time'].append(i_e_time - i_s_time)
-
+            topkidx= torch.zeros((a,q,att_cfg["top"]["num"]), device=attn_weights.device, dtype=torch.long)
+            topkidx_used = False
+            if FAISS[layer_idx][0].ntotal > 1000:
+                with futures.ThreadPoolExecutor(max_workers=32) as executor:
+                    tasks = [executor.submit(faiss_operations, FAISS[layer_idx][i], layer_idx, i, keys_cpu[0][i], queries_cpu[0][i], first_num, att_cfg["top"]["num"]) for i in range(32)]
                 
-            if len(topks) > 0:
-                idx = torch.from_numpy(np.stack(topks)).cuda()
+                    for future in futures.as_completed(tasks):
+                        lx,ix,topk = future.result()
+                        if topk is not None:
+                            topkidx_used = True
+                            topkidx[ix] = torch.from_numpy(topk).to(topkidx.device)
+            else:
+                for i in range(32):
+                    lx,ix,topk = faiss_operations(FAISS[layer_idx][i], layer_idx, i, keys_cpu[0][i], queries_cpu[0][i], first_num, att_cfg["top"]["num"])
+                    if topk is not None:
+                        topkidx_used = True
+                        topkidx[ix] = torch.from_numpy(topk).to(topkidx.device)
+
+            if topkidx_used:
+                idx = topkidx
                 idx = idx.unsqueeze(0)
                 view_idx = idx.view(-1,idx.shape[-1])
                 view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
                 mask.view(-1)[view_idx.view(-1)] = 0.
-
         mask = mask * -3.3895e+38
         attn_weights = attn_weights + mask
     else:
