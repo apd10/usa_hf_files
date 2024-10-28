@@ -200,15 +200,12 @@ if att_cfg is not None and att_cfg["mode"] == "train_usa":
 
 
 def eval_step(layer_idx, key_states, query_states, attn_weights):
-    b,a,k,d = key_states.shape
-    b,a,q,d = query_states.shape
-    K = key_states.permute(0,2,1,3).reshape(b,k,a*d)
-    Q = query_states.permute(0,2,1,3).reshape(b,q,a*d)
-    K = K.to("cuda:1").float()
-    Q = Q.to("cuda:1").float()
+    K = key_states.to("cuda:1").float()
+    Q = query_states.to("cuda:1").float()
 
-    
-    span = USA_MOD[layer_idx](K, Q)
+    k = K.shape[2]
+    q = Q.shape[2]
+    span = USA_MOD[layer_idx](K, Q, hard=True)
     pred = (span > 0.5).float()
 
     attn_weights = attn_weights.to("cuda:1").float()
@@ -233,17 +230,12 @@ def eval_step(layer_idx, key_states, query_states, attn_weights):
 
 @torch.inference_mode(False)
 def train_step(layer_idx, key_states, query_states, attn_weights):
-
-    b,a,k,d = key_states.shape
-    b,a,q,d = query_states.shape
-    K = key_states.permute(0,2,1,3).reshape(b,k,a*d)
-    Q = query_states.permute(0,2,1,3).reshape(b,q,a*d)
-    K = K.to("cuda:1").float()
-    Q = Q.to("cuda:1").float()
+    K = key_states.to("cuda:1").float()
+    Q = query_states.to("cuda:1").float()
+    k = K.shape[2]
+    q = Q.shape[2]
 
     attn_weights = attn_weights.to("cuda:1").float()
-    span = USA_MOD[layer_idx](K, Q)
-
     # prep target with mask
     causal_mask = torch.tril(torch.ones(q,k,device=attn_weights.device), diagonal=k-q).bool()
     mask_value = torch.finfo(attn_weights.dtype).min
@@ -255,8 +247,8 @@ def train_step(layer_idx, key_states, query_states, attn_weights):
     view_idx = idx.view(-1,idx.shape[-1])
     view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
     target.view(-1)[view_idx.view(-1)] = 1.0
-    
-    
+    #print(K.sum().item(), Q.sum().item())
+    span = USA_MOD[layer_idx](K, Q)
     loss = USA_TR['loss_function'](span, target)
     USA_TR['optimizer'].zero_grad()
     loss.backward()
