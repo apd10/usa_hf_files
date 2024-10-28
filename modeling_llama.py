@@ -197,7 +197,16 @@ if att_cfg is not None and att_cfg["mode"] == "train_usa":
     #USA_TR['loss_function'] = nn.KLDivLoss(reduction="batchmean")
     USA_TR['loss_function'] = nn.BCELoss()
     USA_TR['optimizer'] = torch.optim.Adam(USA_MOD.parameters(), lr=0.001)
+    USA_TR['train_iter'] = 0
 
+def save_usa(fname):
+    global USA_MOD
+    torch.save(USA_MOD.cpu().state_dict(), fname)
+    USA_MOD = USA_MOD.to("cuda:1")
+
+
+def load_usa(fname):
+    USA_MOD.load_state_dict(torch.load(fname))
 
 def eval_step(layer_idx, key_states, query_states, attn_weights):
     K = key_states.to("cuda:1").float()
@@ -226,7 +235,7 @@ def eval_step(layer_idx, key_states, query_states, attn_weights):
     overlap = pred * target
     recall = torch.sum(overlap, dim=-1) / torch.sum(target, dim=-1)
     precision = torch.sum(overlap, dim=-1) / (1e-6 + torch.sum(pred, dim=-1))
-    print("Eval layer:", layer_idx, K.shape[1], Q.shape[1], "recall", recall.mean(), "precision", precision.mean())
+    print("[{:8d}] Eval Layer:{} Len:{} Recall:{:.4f} Precision:{:.4f} ".format(USA_TR['train_iter'], layer_idx, k,  recall.mean().item(), precision.mean().item()))
 
 @torch.inference_mode(False)
 def train_step(layer_idx, key_states, query_states, attn_weights):
@@ -253,11 +262,11 @@ def train_step(layer_idx, key_states, query_states, attn_weights):
     USA_TR['optimizer'].zero_grad()
     loss.backward()
     USA_TR['optimizer'].step()
-    print("Train", layer_idx, loss.item())
+    if USA_TR['train_iter'] % 5 == 0 or (layer_idx == 3 and k > 7000):
+        print("[{:8d}] Train Layer:{} Len:{} Loss:{:.4f}".format(USA_TR['train_iter'], layer_idx, k, loss.item()))
 
 RANDOM_BITS = np.random.binomial(size=1000000, n=1, p= 0.2)
 RBIDX = 0
-
 def approximate_attention(attn_weights, layer_idx, hidden_states, keys, queries):
     ''' 
             inputs are 
@@ -383,16 +392,13 @@ def approximate_attention(attn_weights, layer_idx, hidden_states, keys, queries)
         # hidden_states.
         local_num = att_cfg["local"]["num"]
         first_num = att_cfg["first"]["num"]
-        if layer_idx == 2:
-            if keys.shape[2] > (local_num + first_num + 2048) and queries.shape[2] > 1:
-            #if RANDOM_BITS[RBIDX % len(RANDOM_BITS)] :
-                train_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num])
-            #RBIDX+=1
-        if layer_idx == 2:
-            if keys.shape[2] > (local_num + first_num + 2048)  and queries.shape[2] > 1:
-            #    if RANDOM_BITS[RBIDX % len(RANDOM_BITS)]:
+        if keys.shape[2] > (local_num + first_num + 1024) and queries.shape[2] > 1:
+            if USA_TR['train_iter'] % 5 == 0 or (layer_idx == 3 and keys.shape[2] > 7000):
                 eval_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num])
-            #    RBIDX+=1
+            train_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num])
+        if layer_idx == 31 and keys.shape[2] == queries.shape[2]: # counting examples
+            USA_TR['train_iter'] += 1
+
     elif att_cfg["mode"] == "usa":
         pass
     else:
