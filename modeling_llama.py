@@ -70,22 +70,48 @@ if att_cfg_file is not None:
         att_cfg = yaml.safe_load(stream)
 
 
-#res = faiss.StandardGpuResources()
+res = faiss.StandardGpuResources()
 def get_index(index, d):
     Index = faiss.index_factory(d, index, faiss.METRIC_INNER_PRODUCT)
+    if FAISS_GPU:
+        Index = faiss.index_cpu_to_gpu(res, 0, Index)
     return Index
 
+def data_samples(l):
+    s = 0
+    for a in l:
+        s+= a.shape[0]
+    return s
+
+def dev_concatenate(l):
+    if type(l[0]) == np.ndarray:
+        return np.concatenate(l)
+    else:
+        return torch.cat(l)
+    
 FAISS = []
+FAISS_TRAIN_DATA = []
 FAISS_STATS = {}
+FAISS_GPU = False
+COLLECT_STATS = False
+
 if att_cfg is not None and att_cfg["mode"] == "top-faiss":
     print("preparing FAISS for retreival")
     faiss.omp_set_num_threads(att_cfg["faiss"]["threads"])
+    if "use_gpu" in att_cfg.keys():
+        FAISS_GPU = att_cfg["use_gpu"]
 
     for i in range(32):
         modules = []
+        td = []
         for j in range(32):
             modules.append(get_index(att_cfg["faiss"]["index"], 128))
+            td.append([])
+
         FAISS.append(modules)
+        FAISS_TRAIN_DATA.append(td)
+
+
 
     print("FAISS setup with type:", att_cfg["faiss"]["index"])
     FAISS_STATS['indexing'] = {}
@@ -96,17 +122,38 @@ if att_cfg is not None and att_cfg["mode"] == "top-faiss":
     FAISS_STATS['querying']['time'] = []
     FAISS_STATS['querying']['index_size'] = []
     FAISS_STATS['querying']['query_size'] = []
-    
+
+    print("Index metric type is IP:", (FAISS[0][0].metric_type == faiss.METRIC_INNER_PRODUCT))
 
 def dump_faiss_stats(fname):
     import numpy as np
-    np.savez(fname, index_ntotal=np.array(FAISS_STATS['indexing']['index_size']),
-                    index_insert=np.array(FAISS_STATS['indexing']['insert_size']),
-                    index_time=np.array(FAISS_STATS['indexing']['time']),
-                    query_ntotal=np.array(FAISS_STATS['querying']['index_size']),
-                    query_insert=np.array(FAISS_STATS['querying']['query_size']),
-                    query_time=np.array(FAISS_STATS['querying']['time'])
-             )
+    if COLLECT_STATS:
+        np.savez(fname, index_ntotal=np.array(FAISS_STATS['indexing']['index_size']),
+                        index_insert=np.array(FAISS_STATS['indexing']['insert_size']),
+                        index_time=np.array(FAISS_STATS['indexing']['time']),
+                        query_ntotal=np.array(FAISS_STATS['querying']['index_size']),
+                        query_insert=np.array(FAISS_STATS['querying']['query_size']),
+                        query_time=np.array(FAISS_STATS['querying']['time'])
+                )
+
+
+def time_wrap():
+    if FAISS_GPU:
+        torch.cuda.synchronize()
+    return time.time()
+
+def ensure_device_faiss(x):
+    if FAISS_GPU:
+        x = x.cuda().float().contiguous()
+    else:
+        x =np.array(x.cpu().detach().float())
+    return x
+
+def ensure_device_from_faiss(x):
+    if FAISS_GPU:
+        return x
+    else:
+        return torch.from_numpy(x).cuda()
 
 def faiss_operations(faiss, layer_idx, att_idx, keys, queries, offset, top_num):
     topk = None
@@ -115,17 +162,111 @@ def faiss_operations(faiss, layer_idx, att_idx, keys, queries, offset, top_num):
 
     if faiss.ntotal > 0:
         # print("querying", FAISS[layer_idx][i].ntotal, "keys", k, q, flush=True)
+        q_start = time_wrap()
         _, topk = faiss.search(queries, top_num)
+        q_end = time_wrap()
         topk = topk + offset
-        topk
-        
+        if COLLECT_STATS:
+            FAISS_STATS['querying']['time'].append((q_end - q_start)*1000)
+            FAISS_STATS['querying']['index_size'].append(faiss.ntotal)
+            FAISS_STATS['querying']['query_size'].append(queries.shape[0])
+            
     start = max(offset, k-q)
     if start < k:
+        i_start = time_wrap()
         faiss.add(keys[start:])
-
+        i_end = time_wrap()
+        if COLLECT_STATS:
+            FAISS_STATS['indexing']['time'].append((i_end - i_start)*1000)
+            FAISS_STATS['indexing']['index_size'].append(faiss.ntotal)
+            FAISS_STATS['indexing']['insert_size'].append(keys[start:].shape[0])
+        
     return layer_idx, att_idx, topk
 
-def approximate_attention(attn_weights, layer_idx, keys, queries):
+
+# USA 
+from .USA import USA
+if att_cfg is not None and att_cfg["mode"] == "train_usa":
+    print("preparing USA for training")
+    modules = []
+    for i in range(32):
+        modules.append(USA(32, 128, att_cfg["usa_module_config"]))
+    USA_MOD = nn.ModuleList(modules)
+    USA_MOD = USA_MOD.to("cuda:1")
+    USA_TR = {}
+    #USA_TR['loss_function'] = nn.KLDivLoss(reduction="batchmean")
+    USA_TR['loss_function'] = nn.BCELoss()
+    USA_TR['optimizer'] = torch.optim.Adam(USA_MOD.parameters(), lr=0.001)
+
+
+def eval_step(layer_idx, key_states, query_states, attn_weights):
+    b,a,k,d = key_states.shape
+    b,a,q,d = query_states.shape
+    K = key_states.permute(0,2,1,3).reshape(b,k,a*d)
+    Q = query_states.permute(0,2,1,3).reshape(b,q,a*d)
+    K = K.to("cuda:1").float()
+    Q = Q.to("cuda:1").float()
+
+    
+    span = USA_MOD[layer_idx](K, Q)
+    pred = (span > 0.5).float()
+
+    attn_weights = attn_weights.to("cuda:1").float()
+    # prep target with mask
+    causal_mask = torch.tril(torch.ones(q,k,device=attn_weights.device), diagonal=k-q).bool()
+    mask_value = torch.finfo(attn_weights.dtype).min
+    mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
+    attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+    
+    
+    target = torch.zeros_like(attn_weights)
+    _,idx = torch.topk(attn_weights, dim=-1, k=64) # [B,A,S,T]      
+    view_idx = idx.view(-1,idx.shape[-1])
+    view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
+    target.view(-1)[view_idx.view(-1)] = 1.0
+
+    
+    overlap = pred * target
+    recall = torch.sum(overlap, dim=-1) / torch.sum(target, dim=-1)
+    precision = torch.sum(overlap, dim=-1) / (1e-6 + torch.sum(pred, dim=-1))
+    print("Eval layer:", layer_idx, K.shape[1], Q.shape[1], "recall", recall.mean(), "precision", precision.mean())
+
+@torch.inference_mode(False)
+def train_step(layer_idx, key_states, query_states, attn_weights):
+
+    b,a,k,d = key_states.shape
+    b,a,q,d = query_states.shape
+    K = key_states.permute(0,2,1,3).reshape(b,k,a*d)
+    Q = query_states.permute(0,2,1,3).reshape(b,q,a*d)
+    K = K.to("cuda:1").float()
+    Q = Q.to("cuda:1").float()
+
+    attn_weights = attn_weights.to("cuda:1").float()
+    span = USA_MOD[layer_idx](K, Q)
+
+    # prep target with mask
+    causal_mask = torch.tril(torch.ones(q,k,device=attn_weights.device), diagonal=k-q).bool()
+    mask_value = torch.finfo(attn_weights.dtype).min
+    mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
+    attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+
+    target = torch.zeros_like(attn_weights)
+    _,idx = torch.topk(attn_weights, dim=-1, k=64) # [B,A,S,T]      
+    view_idx = idx.view(-1,idx.shape[-1])
+    view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
+    target.view(-1)[view_idx.view(-1)] = 1.0
+    
+    
+    loss = USA_TR['loss_function'](span, target)
+    USA_TR['optimizer'].zero_grad()
+    loss.backward()
+    USA_TR['optimizer'].step()
+    print("Train", layer_idx, loss.item())
+
+RANDOM_BITS = np.random.binomial(size=1000000, n=1, p= 0.2)
+RBIDX = 0
+
+def approximate_attention(attn_weights, layer_idx, hidden_states, keys, queries):
     ''' 
             inputs are 
             attn_weights: unnormlized attention weights
@@ -135,8 +276,8 @@ def approximate_attention(attn_weights, layer_idx, keys, queries):
 
             returns modified attn_weights by adding correct mask 
     '''
-
-    # if layer_idx == 0:
+    global RBIDX
+    #if layer_idx == 0:
     #     print(keys.shape)
     if att_cfg_file is None:
         return attn_weights
@@ -187,6 +328,18 @@ def approximate_attention(attn_weights, layer_idx, keys, queries):
 
 
     elif att_cfg["mode"] == "top-faiss":
+        if not FAISS[layer_idx][0].is_trained: 
+
+            if layer_idx == 0:
+                print("Faiss is not trained yet -- exact inference and data accumulation in progress")
+            for i in range(32):
+                FAISS_TRAIN_DATA[layer_idx][i].append(ensure_device_faiss(torch.cat([queries[0][i], keys[0][i][-q:]])))
+                if data_samples(FAISS_TRAIN_DATA[layer_idx][i]) > 10000:
+                    FAISS[layer_idx][i].train(dev_concatenate(FAISS_TRAIN_DATA[layer_idx][i]))
+                    print("Training {}:{}".format(layer_idx, i))
+            return attn_weights
+
+            
         local_num = att_cfg["local"]["num"]
         first_num = att_cfg["first"]["num"]
         assert(b == 1)
@@ -205,25 +358,25 @@ def approximate_attention(attn_weights, layer_idx, keys, queries):
             pass
         else:
             # move to cpu
-            queries_cpu = np.array(queries.cpu().detach().float())
-            keys_cpu = np.array(keys.cpu().detach().float())
+            queries_dev = ensure_device_faiss(queries)
+            keys_dev = ensure_device_faiss(keys)
             topkidx= torch.zeros((a,q,att_cfg["top"]["num"]), device=attn_weights.device, dtype=torch.long)
             topkidx_used = False
-            if FAISS[layer_idx][0].ntotal > 1000:
+            if FAISS[layer_idx][0].ntotal > 100000: # not useful
                 with futures.ThreadPoolExecutor(max_workers=32) as executor:
-                    tasks = [executor.submit(faiss_operations, FAISS[layer_idx][i], layer_idx, i, keys_cpu[0][i], queries_cpu[0][i], first_num, att_cfg["top"]["num"]) for i in range(32)]
+                    tasks = [executor.submit(faiss_operations, FAISS[layer_idx][i], layer_idx, i, keys_dev[0][i], queries_dev[0][i], first_num, att_cfg["top"]["num"]) for i in range(32)]
                 
                     for future in futures.as_completed(tasks):
                         lx,ix,topk = future.result()
                         if topk is not None:
                             topkidx_used = True
-                            topkidx[ix] = torch.from_numpy(topk).to(topkidx.device)
+                            topkidx[ix] = ensure_device_from_faiss(topk)
             else:
                 for i in range(32):
-                    lx,ix,topk = faiss_operations(FAISS[layer_idx][i], layer_idx, i, keys_cpu[0][i], queries_cpu[0][i], first_num, att_cfg["top"]["num"])
+                    lx,ix,topk = faiss_operations(FAISS[layer_idx][i], layer_idx, i, keys_dev[0][i], queries_dev[0][i], first_num, att_cfg["top"]["num"])
                     if topk is not None:
                         topkidx_used = True
-                        topkidx[ix] = torch.from_numpy(topk).to(topkidx.device)
+                        topkidx[ix] = ensure_device_from_faiss(topk)
 
             if topkidx_used:
                 idx = topkidx
@@ -233,6 +386,23 @@ def approximate_attention(attn_weights, layer_idx, keys, queries):
                 mask.view(-1)[view_idx.view(-1)] = 0.
         mask = mask * -3.3895e+38
         attn_weights = attn_weights + mask
+    elif att_cfg["mode"] == "train_usa":
+        pass
+        # hidden_states.
+        local_num = att_cfg["local"]["num"]
+        first_num = att_cfg["first"]["num"]
+        if layer_idx == 2:
+            if keys.shape[2] > (local_num + first_num + 2048) and queries.shape[2] > 1:
+            #if RANDOM_BITS[RBIDX % len(RANDOM_BITS)] :
+                train_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num])
+            #RBIDX+=1
+        if layer_idx == 2:
+            if keys.shape[2] > (local_num + first_num + 2048)  and queries.shape[2] > 1:
+            #    if RANDOM_BITS[RBIDX % len(RANDOM_BITS)]:
+                eval_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num])
+            #    RBIDX+=1
+    elif att_cfg["mode"] == "usa":
+        pass
     else:
         raise NotImplementedError
     return attn_weights
@@ -604,8 +774,7 @@ class LlamaAttention(nn.Module):
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        attn_weights = approximate_attention(attn_weights, self.layer_idx, key_states, query_states)
-
+        attn_weights = approximate_attention(attn_weights, self.layer_idx, hidden_states, key_states, query_states)
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
