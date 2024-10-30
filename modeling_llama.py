@@ -26,7 +26,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-
+from math import sqrt
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, StaticCache
 from ...generation import GenerationMixin
@@ -186,6 +186,13 @@ def faiss_operations(faiss, layer_idx, att_idx, keys, queries, offset, top_num):
 
 # USA 
 from .USA import USA
+
+def loss_function(yhat ,ytarget, beta):
+    weight = ytarget * (beta - 1) + torch.ones_like(ytarget)
+    loss = nn.functional.binary_cross_entropy(yhat.reshape(-1), ytarget.reshape(-1), weight = weight.reshape(-1))
+    return loss
+
+
 if att_cfg is not None and att_cfg["mode"] == "train_usa":
     print("preparing USA for training")
     modules = []
@@ -195,9 +202,27 @@ if att_cfg is not None and att_cfg["mode"] == "train_usa":
     USA_MOD = USA_MOD.to("cuda:1")
     USA_TR = {}
     #USA_TR['loss_function'] = nn.KLDivLoss(reduction="batchmean")
-    USA_TR['loss_function'] = nn.BCELoss()
+    def bceloss(yhat, ytarget):
+        return loss_function(yhat, ytarget, beta=att_cfg["recall_weight"])
+    
+    USA_TR['loss_function'] = bceloss
     USA_TR['optimizer'] = torch.optim.Adam(USA_MOD.parameters(), lr=0.001)
-    USA_TR['train_iter'] = 0
+    USA_LOG = {}
+    USA_LOG['iter'] = 0
+USA_STAT = None
+if att_cfg is not None and att_cfg["mode"] == "usa":
+    print("preparing USA for eval")
+    modules = []
+    for i in range(32):
+        modules.append(USA(32, 128, att_cfg["usa_module_config"]))
+    USA_MOD = nn.ModuleList(modules)
+    USA_MOD = USA_MOD.to("cuda:1")
+    USA_LOG={}
+    USA_LOG['iter'] = 0
+    USA_STAT_LENS = [4096, 8192, 12288, 16384]
+    USA_STAT = {}
+    for l in USA_STAT_LENS:
+        USA_STAT[l] = [0,0,0,0,0] # sum(x), sum(x^2), count, mean (current), std (current)
 
 def save_usa(fname):
     global USA_MOD
@@ -208,7 +233,7 @@ def save_usa(fname):
 def load_usa(fname):
     USA_MOD.load_state_dict(torch.load(fname))
 
-def eval_step(layer_idx, key_states, query_states, attn_weights):
+def eval_step(layer_idx, key_states, query_states, attn_weights, verbose=False):
     K = key_states.to("cuda:1").float()
     Q = query_states.to("cuda:1").float()
 
@@ -217,25 +242,27 @@ def eval_step(layer_idx, key_states, query_states, attn_weights):
     span = USA_MOD[layer_idx](K, Q, hard=True)
     pred = (span > 0.5).float()
 
-    attn_weights = attn_weights.to("cuda:1").float()
-    # prep target with mask
-    causal_mask = torch.tril(torch.ones(q,k,device=attn_weights.device), diagonal=k-q).bool()
-    mask_value = torch.finfo(attn_weights.dtype).min
-    mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
-    attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
-    
-    
-    target = torch.zeros_like(attn_weights)
-    _,idx = torch.topk(attn_weights, dim=-1, k=64) # [B,A,S,T]      
-    view_idx = idx.view(-1,idx.shape[-1])
-    view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
-    target.view(-1)[view_idx.view(-1)] = 1.0
+    if verbose:
+        attn_weights = attn_weights.to("cuda:1").float()
+        # prep target with mask
+        causal_mask = torch.tril(torch.ones(q,k,device=attn_weights.device), diagonal=k-q).bool()
+        mask_value = torch.finfo(attn_weights.dtype).min
+        mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
+        attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
+        
+        
+        target = torch.zeros_like(attn_weights)
+        _,idx = torch.topk(attn_weights, dim=-1, k=64) # [B,A,S,T]      
+        view_idx = idx.view(-1,idx.shape[-1])
+        view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
+        target.view(-1)[view_idx.view(-1)] = 1.0
 
-    
-    overlap = pred * target
-    recall = torch.sum(overlap, dim=-1) / torch.sum(target, dim=-1)
-    precision = torch.sum(overlap, dim=-1) / (1e-6 + torch.sum(pred, dim=-1))
-    print("[{:8d}] Eval Layer:{} Len:{} Recall:{:.4f} Precision:{:.4f} ".format(USA_TR['train_iter'], layer_idx, k,  recall.mean().item(), precision.mean().item()))
+        
+        overlap = pred * target
+        recall = torch.sum(overlap, dim=-1) / torch.sum(target, dim=-1)
+        precision = torch.sum(overlap, dim=-1) / (1e-6 + torch.sum(pred, dim=-1))
+        print("[{:8d}] Eval Layer:{} Len:{} Recall:{:.4f} Precision:{:.4f} ".format(USA_LOG['iter'], layer_idx, k,  recall.mean().item(), precision.mean().item()))
+    return pred
 
 @torch.inference_mode(False)
 def train_step(layer_idx, key_states, query_states, attn_weights):
@@ -262,8 +289,8 @@ def train_step(layer_idx, key_states, query_states, attn_weights):
     USA_TR['optimizer'].zero_grad()
     loss.backward()
     USA_TR['optimizer'].step()
-    if USA_TR['train_iter'] % 5 == 0 or (layer_idx == 3 and k > 7000):
-        print("[{:8d}] Train Layer:{} Len:{} Loss:{:.4f}".format(USA_TR['train_iter'], layer_idx, k, loss.item()))
+    if USA_LOG['iter'] % 5 == 0 or (layer_idx == 3 and k > 7000):
+        print("[{:8d}] Train Layer:{} Len:{} Loss:{:.4f}".format(USA_LOG['iter'], layer_idx, k, loss.item()))
 
 RANDOM_BITS = np.random.binomial(size=1000000, n=1, p= 0.2)
 RBIDX = 0
@@ -393,14 +420,36 @@ def approximate_attention(attn_weights, layer_idx, hidden_states, keys, queries)
         local_num = att_cfg["local"]["num"]
         first_num = att_cfg["first"]["num"]
         if keys.shape[2] > (local_num + first_num + 1024) and queries.shape[2] > 1:
-            if USA_TR['train_iter'] % 5 == 0 or (layer_idx == 3 and keys.shape[2] > 7000):
-                eval_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num])
+            if (USA_LOG['iter'] % 5 == 0) or (layer_idx == 3 and keys.shape[2] > 7000):
+                eval_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num], verbose=True)
+
             train_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num])
+
         if layer_idx == 31 and keys.shape[2] == queries.shape[2]: # counting examples
-            USA_TR['train_iter'] += 1
+            USA_LOG['iter'] += 1
 
     elif att_cfg["mode"] == "usa":
-        pass
+        local_num = att_cfg["local"]["num"]
+        first_num = att_cfg["first"]["num"]
+        mask = torch.tril(torch.ones(q,k,device=attn_weights.device), diagonal=k-q-local_num)
+        mask[:,:first_num] = 0.
+        mask = mask.unsqueeze(0).unsqueeze(0).broadcast_to(attn_weights.shape).contiguous()
+        if first_num + local_num < k:
+            pred = eval_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num], verbose=(USA_LOG['iter'] < 2))
+            pred = pred.to(mask.device)
+            mask[:,:,:,first_num:-local_num] = mask[:,:,:,first_num:-local_num] * (1. - pred) # making things zero in mask which are to be predicted.
+        if k in USA_STAT_LENS:
+            pt = pred.sum(dim=-1)
+            USA_STAT[k][0] += torch.sum(pt).item()
+            USA_STAT[k][1] += torch.sum(torch.square(pt)).item()
+            USA_STAT[k][2] += pt.numel()
+            USA_STAT[k][3] = USA_STAT[k][0]  / USA_STAT[k][2]
+            USA_STAT[k][4] = sqrt((USA_STAT[k][1]  / USA_STAT[k][2] - USA_STAT[k][3] **2))
+            # print(USA_STAT)
+        mask = mask * -3.3895e+38
+        attn_weights = attn_weights + mask
+        if layer_idx == 31 and keys.shape[2] == queries.shape[2]: # counting examples
+            USA_LOG['iter'] += 1
     else:
         raise NotImplementedError
     return attn_weights
