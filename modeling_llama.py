@@ -233,14 +233,16 @@ def save_usa(fname):
 def load_usa(fname):
     USA_MOD.load_state_dict(torch.load(fname))
 
-def eval_step(layer_idx, key_states, query_states, attn_weights, verbose=False):
+def eval_step(layer_idx, key_states, query_states, attn_weights, topk, verbose=False, depth=2):
     K = key_states.to("cuda:1").float()
     Q = query_states.to("cuda:1").float()
 
     k = K.shape[2]
     q = Q.shape[2]
     span = USA_MOD[layer_idx](K, Q, hard=True)
-    pred = (span > 0.5).float()
+    max_bucket_score,_ = torch.max(span, dim=-1, keepdims=True)
+    thold = max_bucket_score - 2*depth
+    pred = (span >= thold).float()
 
     if verbose:
         attn_weights = attn_weights.to("cuda:1").float()
@@ -252,7 +254,7 @@ def eval_step(layer_idx, key_states, query_states, attn_weights, verbose=False):
         
         
         target = torch.zeros_like(attn_weights)
-        _,idx = torch.topk(attn_weights, dim=-1, k=64) # [B,A,S,T]      
+        _,idx = torch.topk(attn_weights, dim=-1, k=topk) # [B,A,S,T]      
         view_idx = idx.view(-1,idx.shape[-1])
         view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
         target.view(-1)[view_idx.view(-1)] = 1.0
@@ -265,7 +267,7 @@ def eval_step(layer_idx, key_states, query_states, attn_weights, verbose=False):
     return pred
 
 @torch.inference_mode(False)
-def train_step(layer_idx, key_states, query_states, attn_weights):
+def train_step(layer_idx, key_states, query_states, attn_weights, topk):
     K = key_states.to("cuda:1").float()
     Q = query_states.to("cuda:1").float()
     k = K.shape[2]
@@ -279,7 +281,7 @@ def train_step(layer_idx, key_states, query_states, attn_weights):
     attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
 
     target = torch.zeros_like(attn_weights)
-    _,idx = torch.topk(attn_weights, dim=-1, k=64) # [B,A,S,T]      
+    _,idx = torch.topk(attn_weights, dim=-1, k=topk) # [B,A,S,T]      
     view_idx = idx.view(-1,idx.shape[-1])
     view_idx = view_idx + torch.arange(view_idx.shape[0], device=view_idx.device).reshape(-1,1) * attn_weights.shape[-1]
     target.view(-1)[view_idx.view(-1)] = 1.0
@@ -419,11 +421,15 @@ def approximate_attention(attn_weights, layer_idx, hidden_states, keys, queries)
         # hidden_states.
         local_num = att_cfg["local"]["num"]
         first_num = att_cfg["first"]["num"]
+        depth = att_cfg["usa_eval_depth"]
+        train_topk = att_cfg["usa_train_topk"]
+        eval_topk = att_cfg["usa_eval_topk"]
+
         if keys.shape[2] > (local_num + first_num + 1024) and queries.shape[2] > 1:
             if (USA_LOG['iter'] % 5 == 0) or (layer_idx == 3 and keys.shape[2] > 7000):
-                eval_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num], verbose=True)
+                eval_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num], eval_topk, verbose=True, depth=depth)
 
-            train_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num])
+            train_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num], train_topk)
 
         if layer_idx == 31 and keys.shape[2] == queries.shape[2]: # counting examples
             USA_LOG['iter'] += 1
@@ -431,11 +437,14 @@ def approximate_attention(attn_weights, layer_idx, hidden_states, keys, queries)
     elif att_cfg["mode"] == "usa":
         local_num = att_cfg["local"]["num"]
         first_num = att_cfg["first"]["num"]
+        depth = att_cfg["usa_eval_depth"]
+        eval_topk = att_cfg["usa_eval_topk"]
+
         mask = torch.tril(torch.ones(q,k,device=attn_weights.device), diagonal=k-q-local_num)
         mask[:,:first_num] = 0.
         mask = mask.unsqueeze(0).unsqueeze(0).broadcast_to(attn_weights.shape).contiguous()
         if first_num + local_num < k:
-            pred = eval_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num], verbose=(USA_LOG['iter'] < 2))
+            pred = eval_step(layer_idx, keys[:,:,first_num:-local_num,:], queries, attn_weights[:,:,:,first_num:-local_num], eval_topk, verbose=(USA_LOG['iter'] < 2), depth=depth)
             pred = pred.to(mask.device)
             mask[:,:,:,first_num:-local_num] = mask[:,:,:,first_num:-local_num] * (1. - pred) # making things zero in mask which are to be predicted.
         if k in USA_STAT_LENS:
