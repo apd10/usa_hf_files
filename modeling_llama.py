@@ -62,6 +62,26 @@ import yaml
 import faiss
 import faiss.contrib.torch_utils
 import concurrent.futures as futures
+import gc
+def get_gb(num):
+    return num * 2 / 1000000000
+
+def print_objects():
+    import gc
+    total_tensors = 0
+    total_memory = 0
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                if torch.is_tensor(obj) and obj.is_cuda and obj.numel() > 1024:
+                    if type(obj) in [torch.Tensor]:
+                        print(type(obj), obj.size(), "GB:{:.6F}".format(get_gb(obj.numel())), flush=True)
+                        total_tensors += get_gb(obj.numel())
+                    total_memory += get_gb(obj.numel())
+        except:
+            pass
+    print("TOTAL GB:", total_tensors, " ", total_memory)
+
 
 att_cfg_file = os.environ.get("ATT_CONFIG", None)
 att_cfg = None
@@ -255,6 +275,8 @@ def eval_step(layer_idx, key_states, query_states, attn_weights, topk, verbose=F
             pred = (span >= thold).float()
         else:
             pred = (span >= b_thold).float()
+    else:
+        pred = (span - USA_MOD[layer_idx].lth_thold > 0).float()
 
     if verbose:
         attn_weights = attn_weights.to("cuda:1").float()
