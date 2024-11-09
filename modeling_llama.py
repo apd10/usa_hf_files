@@ -66,6 +66,16 @@ import gc
 def get_gb(num):
     return num * 2 / 1000000000
 
+def memory_efficient_softmax(x, dim):
+    # Subtract max for numerical stability (log-sum-exp trick)
+    max_x = torch.max(x, dim=dim, keepdim=True).values
+    exp_x = torch.exp(x - max_x)
+    
+    # Compute softmax
+    softmax_x = exp_x / torch.sum(exp_x, dim=-1, keepdim=True)
+    return softmax_x    
+
+
 def print_objects():
     import gc
     total_tensors = 0
@@ -873,6 +883,9 @@ class LlamaAttention(nn.Module):
         attn_weights = approximate_attention(attn_weights, self.layer_idx, hidden_states, key_states, query_states)
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        #if self.layer_idx == 0:
+        #    print(key_states.shape, flush=True)
+        #attn_weights = memory_efficient_softmax(attn_weights, dim=-1).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
